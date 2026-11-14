@@ -1,0 +1,17 @@
+[package]
+name = "hft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = "0.8"       # Для многопоточности и очередей (если не писать с нуля)
+serde = { version = "1.0", features = ["derive"] } # Для конфигов
+toml = "0.8"            # Чтение конфигурационных файлов
+log = "0.4"
+env_logger = "0.10"
+
+[profile.release]
+opt-level = 3           # Максимальная оптимизация компилятора
+codegen-units = 1       # Улучшает инлайнинг функций
+panic = "abort"         # Убирает разметку раскрутки стека для скорости
+lto = true              # Link Time Optimization
