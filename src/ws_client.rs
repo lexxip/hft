@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::order_book::{OrderBook, Side};
@@ -32,52 +32,75 @@ pub async fn run_bybit_feed(
     risk: RiskEngine,
 ) {
     let url = "wss://stream.bybit.com/v5/public/linear";
-    
+
     println!("[WS] Connecting to Bybit WebSocket: {} ...", url);
 
     let mut last_dashboard_print = Instant::now();
     let dashboard_interval = Duration::from_secs(1);
 
-    // Обертка tokio::select! объединяет торговый поток и ожидание Ctrl+C
     tokio::select! {
         _ = async {
             loop {
                 match connect_async(url).await {
-                    Ok((mut ws_stream, _)) => {
+                    Ok((ws_stream, _)) => {
                         println!("[WS] Connected successfully! Subscribing to orderbook for {}", symbol);
 
+                        // 1. Разделяем поток: write — для подписки и heartbeat, read — для данных
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // 2. Стакан от прошлой сессии невалиден — очищаем ДО подписки
+                        book.clear();
+
+                        // 3. Подписка
                         let subscribe_msg = serde_json::json!({
                             "op": "subscribe",
                             "args": [format!("orderbook.50.{}", symbol)]
                         });
 
-                        if let Err(e) = ws_stream.send(Message::Text(subscribe_msg.to_string())).await {
+                        if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                             eprintln!("[WS] Failed to send subscription: {}", e);
                             continue;
                         }
 
-                        while let Some(msg) = ws_stream.next().await {
+                        // 4. Фоновая задача для прикладного heartbeat Bybit ({"op":"ping"})
+                        let ping_handle = tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(15));
+                            interval.tick().await; // первый tick срабатывает сразу — пропускаем
+
+                            loop {
+                                interval.tick().await;
+                                let ping_msg = Message::Text(r#"{"op":"ping"}"#.to_string());
+                                if let Err(e) = write.send(ping_msg).await {
+                                    eprintln!("[WS] Heartbeat send failed: {}", e);
+                                    break;
+                                }
+                            }
+                        });
+
+                        // 5. Основной цикл чтения
+                        while let Some(msg) = read.next().await {
                             match msg {
                                 Ok(Message::Text(text)) => {
                                     if let Ok(ob_msg) = serde_json::from_str::<BybitOrderBookMsg>(&text) {
                                         if ob_msg.topic.starts_with("orderbook") {
-                                            // 1. Обновляем стакан
+                                            // snapshot — полная замена стакана
+                                            if ob_msg.msg_type == "snapshot" {
+                                                book.clear();
+                                            }
+
                                             apply_bybit_update(&mut book, &ob_msg);
 
-                                            let now_ns = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_nanos() as u64;
+                                            // Bybit ts — микросекунды; в наносекунды: *1000
+                                            let now_ns = ob_msg.ts * 1_000;
 
-                                            // 2. Оцениваем стратегию
                                             if let Some(signal) = strategy.evaluate(&book, &risk, now_ns) {
                                                 println!(
                                                     "\n🔥 [SIGNAL] {:?} qty={} @ price={} | Pos: {} | PnL: {}",
-                                                    signal.side, signal.quantity, signal.price, risk.position(), risk.daily_pnl()
+                                                    signal.side, signal.quantity, signal.price,
+                                                    risk.position(), risk.daily_pnl()
                                                 );
                                             }
 
-                                            // 3. Выводим консольный дашборд раз в секунду
                                             if last_dashboard_print.elapsed() >= dashboard_interval {
                                                 print_trading_dashboard(&book, &risk, &symbol);
                                                 last_dashboard_print = Instant::now();
@@ -85,16 +108,20 @@ pub async fn run_bybit_feed(
                                         }
                                     }
                                 }
-                                Ok(Message::Ping(ping)) => {
-                                    let _ = ws_stream.send(Message::Pong(ping)).await;
-                                }
                                 Err(e) => {
                                     eprintln!("[WS] Stream error: {}", e);
-                                    break; // Выход из inner loop для реконнекта
+                                    break;
                                 }
+                                // Ping/Pong/Binary/Close — игнорируем,
+                                // tungstenite автоматически отвечает на WebSocket-level Ping
                                 _ => {}
                             }
                         }
+
+                        // 6. Останавливаем heartbeat при выходе из цикла чтения
+                        ping_handle.abort();
+
+                        println!("[WS] Disconnected. Reconnecting...");
                     }
                     Err(e) => {
                         eprintln!("[WS] Connection error: {}. Retrying in 3 seconds...", e);
@@ -104,7 +131,6 @@ pub async fn run_bybit_feed(
             }
         } => {}
 
-        // Перехват Ctrl+C
         _ = tokio::signal::ctrl_c() => {
             println!("\n\n🛑 [SHUTDOWN] Interrupt signal received (Ctrl+C).");
             println!("💾 Flushing buffers and saving CSV logs safely...");
@@ -114,19 +140,37 @@ pub async fn run_bybit_feed(
     println!("✅ [SHUTDOWN] Application exited gracefully. Goodbye!");
 }
 
+/// Парсит "67432.10" в fixed-point с заданным scale (например, 100 → 6743210).
+fn parse_fixed(s: &str, scale: u32) -> Option<u64> {
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+    let int_v: u64 = int_part.parse().ok()?;
+    let mul = 10u64.checked_pow(scale)?;
+
+    let mut frac = frac_part.to_string();
+    let target = scale as usize;
+    while frac.len() < target {
+        frac.push('0');
+    }
+    frac.truncate(target);
+
+    let frac_v: u64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().ok()?
+    };
+
+    int_v.checked_mul(mul)?.checked_add(frac_v)
+}
+
 fn apply_bybit_update(book: &mut OrderBook, msg: &BybitOrderBookMsg) {
-    for (price_str, size_str) in &msg.data.b {
-        if let (Ok(price_f), Ok(size_f)) = (price_str.parse::<f64>(), size_str.parse::<f64>()) {
-            let price = (price_f * 100.0) as u64;
-            let size = size_f as u64;
+    // price scale = 2 (центы), size scale = 3 (мили-BTC)
+    for (p, s) in &msg.data.b {
+        if let (Some(price), Some(size)) = (parse_fixed(p, 2), parse_fixed(s, 3)) {
             book.update_level(Side::Bid, price, size);
         }
     }
-
-    for (price_str, size_str) in &msg.data.a {
-        if let (Ok(price_f), Ok(size_f)) = (price_str.parse::<f64>(), size_str.parse::<f64>()) {
-            let price = (price_f * 100.0) as u64;
-            let size = size_f as u64;
+    for (p, s) in &msg.data.a {
+        if let (Some(price), Some(size)) = (parse_fixed(p, 2), parse_fixed(s, 3)) {
             book.update_level(Side::Ask, price, size);
         }
     }
@@ -142,12 +186,15 @@ fn print_trading_dashboard(book: &OrderBook, risk: &RiskEngine, symbol: &str) {
     let ask_float = best_ask.0 as f64 / 100.0;
     let spread_float = spread as f64 / 100.0;
 
-    print!("\x1B[2J\x1B[1H"); // Очистка экрана терминала
+    let bid_vol_float = best_bid.1 as f64 / 1000.0;
+    let ask_vol_float = best_ask.1 as f64 / 1000.0;
+
+    print!("\x1B[2J\x1B[1H");
     println!("============================================================");
     println!("📊 HFT PLATFORM LIVE DASHBOARD [{}]", symbol);
     println!("============================================================");
-    println!("  Best Bid  : {:.2} (vol: {})", bid_float, best_bid.1);
-    println!("  Best Ask  : {:.2} (vol: {})", ask_float, best_ask.1);
+    println!("  Best Bid  : {:.2} (vol: {:.3})", bid_float, bid_vol_float);
+    println!("  Best Ask  : {:.2} (vol: {:.3})", ask_float, ask_vol_float);
     println!("  Spread    : {:.2}", spread_float);
     println!("------------------------------------------------------------");
     println!("  Position  : {} lots", risk.position());
